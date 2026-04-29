@@ -76,6 +76,39 @@ static uint32_t *tmds_bufs[DVI_N_TMDS_BUFFERS] = {
 
 static struct dvi_inst dvi0;
 
+// Variant of dvi_init() that accepts caller-provided TMDS buffers instead of
+// malloc-ing them.  Lifted verbatim from PicoDVI dvi.c so the submodule needs
+// no local patches.  All symbols used here are declared in the public headers
+// (dvi.h, dvi_timing.h, dvi_serialiser.h) or in the Pico SDK.
+static void dvi_init_with_buffers(struct dvi_inst *inst,
+                                  uint spinlock_tmds_queue,
+                                  uint spinlock_colour_queue,
+                                  uint32_t **bufs, int n_bufs) {
+    dvi_timing_state_init(&inst->timing_state);
+    dvi_serialiser_init(&inst->ser_cfg);
+    for (int i = 0; i < N_TMDS_LANES; ++i) {
+        inst->dma_cfg[i].chan_ctrl = dma_claim_unused_channel(true);
+        inst->dma_cfg[i].chan_data = dma_claim_unused_channel(true);
+        inst->dma_cfg[i].tx_fifo  = (void *)&inst->ser_cfg.pio->txf[inst->ser_cfg.sm_tmds[i]];
+        inst->dma_cfg[i].dreq     = pio_get_dreq(inst->ser_cfg.pio, inst->ser_cfg.sm_tmds[i], true);
+    }
+    inst->late_scanline_ctr     = 0;
+    inst->tmds_buf_release_next = NULL;
+    inst->tmds_buf_release      = NULL;
+    queue_init_with_spinlock(&inst->q_tmds_valid,   sizeof(void *), 8, spinlock_tmds_queue);
+    queue_init_with_spinlock(&inst->q_tmds_free,    sizeof(void *), 8, spinlock_tmds_queue);
+    queue_init_with_spinlock(&inst->q_colour_valid, sizeof(void *), 8, spinlock_colour_queue);
+    queue_init_with_spinlock(&inst->q_colour_free,  sizeof(void *), 8, spinlock_colour_queue);
+    dvi_setup_scanline_for_vblank(inst->timing, inst->dma_cfg, true,  &inst->dma_list_vblank_sync);
+    dvi_setup_scanline_for_vblank(inst->timing, inst->dma_cfg, false, &inst->dma_list_vblank_nosync);
+    dvi_setup_scanline_for_active(inst->timing, inst->dma_cfg, (void *)SRAM_BASE, &inst->dma_list_active);
+    dvi_setup_scanline_for_active(inst->timing, inst->dma_cfg, NULL,              &inst->dma_list_error);
+    for (int i = 0; i < n_bufs; ++i) {
+        void *tmdsbuf = bufs[i];
+        queue_add_blocking_u32(&inst->q_tmds_free, &tmdsbuf);
+    }
+}
+
 // Core1: own the DVI display loop.  For each DVI frame, render 240 lines by
 // calling vrEmuTms9918ScanLine for the 192 active rows and showing black borders.
 // Runs from __not_in_flash_func (SRAM) — safe alongside flash writes on core0.

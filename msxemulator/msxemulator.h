@@ -3,8 +3,10 @@
 //#define USE_I2S     // Enable I2S DAC Output and SCC emulation
 //#define USE_OPLL    // Enable OPLL emulation. need FM-PAC BIOS.
 #define USE_FDC     // Enable SONY HBD-F1 emulation. need DISKBIOS.
-//#define USE_MORE_OVERCLOCK    // Change System Core clock from 225MHz to 250MHz
-//#define USE_CORE_VOLTAGE12    // Change Core voltage to 1.2Volt
+// DVI port: always 252MHz, always 1.2V core
+#define USE_CORE_VOLTAGE12    // Required for 252MHz (PicoDVI)
+// Reserve 1MB for firmware+carts in flash (DVI firmware is larger than original VGA)
+#define HW_SYSTEM_RESERVED  1024     // KiB (was 512)
 
 
 // Dependency

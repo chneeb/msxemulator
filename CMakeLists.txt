@@ -22,4 +22,13 @@ pico_sdk_init()
 
 project(msxemulator)
 
+set(DVI_DEFAULT_SERIAL_CONFIG waveshare_rp2040_pizero)
+add_compile_definitions(
+    DVI_DEFAULT_SERIAL_CONFIG=${DVI_DEFAULT_SERIAL_CONFIG}
+    # Place pico_mem_ops (memset/memcpy wrappers) in SRAM so core1's render
+    # loop can call memset without stalling when XIP is disabled on core0.
+    PICO_MEM_IN_RAM=1
+)
+add_subdirectory(PicoDVI/software/libdvi)
+
 add_subdirectory(msxemulator)

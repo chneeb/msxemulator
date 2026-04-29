@@ -71,6 +71,7 @@ extern "C"
   void PSG_setClockDivider(PSG *psg, uint8_t enable);
   void PSG_setRate (PSG * psg, uint32_t rate);
   PSG *PSG_new (uint32_t clk, uint32_t rate);
+  void PSG_init (PSG *psg, uint32_t clk, uint32_t rate); /* init pre-allocated struct */
   void PSG_reset (PSG *);
   void PSG_delete (PSG *);
   void PSG_writeReg (PSG *, uint32_t reg, uint32_t val);

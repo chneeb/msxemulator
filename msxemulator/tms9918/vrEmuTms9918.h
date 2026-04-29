@@ -48,11 +48,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/* PRIVATE DATA STRUCTURE
- * ---------------------------------------- */
-struct vrEmuTMS9918_s;
-typedef struct vrEmuTMS9918_s VrEmuTms9918;
-
 typedef enum
 {
   TMS_MODE_GRAPHICS_I,
@@ -102,6 +97,23 @@ typedef enum
 
 #define TMS9918_PIXELS_X 256
 #define TMS9918_PIXELS_Y 192
+
+/* DATA STRUCTURE — exposed so callers can statically allocate instances.
+ * Use vrEmuTms9918Reset() to initialise; do not access fields directly.
+ * ---------------------------------------- */
+struct vrEmuTMS9918_s
+{
+  uint8_t registers[TMS_NUM_REGISTERS]; /* eight write-only registers */
+  uint8_t status;
+  uint16_t currentAddress;
+  uint8_t regWriteStage;
+  uint8_t regWriteStage0Value;
+  uint8_t readAheadBuffer;
+  vrEmuTms9918Mode mode;
+  uint8_t vram[16384];                  /* 16KB VRAM */
+  uint8_t rowSpriteBits[TMS9918_PIXELS_X];
+};
+typedef struct vrEmuTMS9918_s VrEmuTms9918;
 
 
 /* PUBLIC INTERFACE

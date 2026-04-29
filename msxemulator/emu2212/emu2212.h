@@ -52,6 +52,7 @@ typedef struct __SCC {
 
 
 SCC *SCC_new(uint32_t c, uint32_t r) ;
+void SCC_init(SCC *scc, uint32_t c, uint32_t r); /* init pre-allocated struct */
 void SCC_reset(SCC *scc) ;
 void SCC_set_rate(SCC *scc, uint32_t r);
 void SCC_set_quality(SCC *scc, uint32_t q) ;

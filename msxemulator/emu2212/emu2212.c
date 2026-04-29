@@ -121,6 +121,18 @@ SCC_new (uint32_t c, uint32_t r)
   return scc;
 }
 
+/* Initialise a pre-allocated SCC struct (no malloc). Equivalent to SCC_new
+ * but writes into an already-allocated struct, typically a static global. */
+void
+SCC_init (SCC *scc, uint32_t c, uint32_t r)
+{
+  memset(scc, 0, sizeof(SCC));
+  scc->clk = c;
+  scc->rate = r ? r : 44100;
+  SCC_set_quality(scc, 0);
+  scc->type = SCC_ENHANCED;
+}
+
 void
 SCC_reset (SCC * scc)
 {

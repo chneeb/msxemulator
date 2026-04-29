@@ -1,3 +1,4 @@
 build/
 lfs/
 msxemulator/msxrom_test.h
+msxemulator/bios/

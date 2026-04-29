@@ -114,6 +114,21 @@ PSG_new (uint32_t clock, uint32_t rate)
   return psg;
 }
 
+/* Initialise a pre-allocated PSG struct (no malloc). Equivalent to PSG_new
+ * but writes into an already-allocated struct, typically a static global. */
+void
+PSG_init (PSG *psg, uint32_t clock, uint32_t rate)
+{
+  memset(psg, 0, sizeof(PSG));
+  PSG_setVolumeMode(psg, 0);
+  psg->clk = clock;
+  psg->clk_div = 0;
+  psg->rate = rate ? rate : 44100;
+  psg->quality = 0;
+  internal_refresh(psg);
+  PSG_setMask(psg, 0x00);
+}
+
 void
 PSG_setVolumeMode (PSG * psg, int type)
 {

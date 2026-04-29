@@ -22,8 +22,8 @@
 #include <string.h>
 
 #include "pico/stdlib.h"
-#include "pico/multicore.h"
 #include "pico/sync.h"
+#include "pico/multicore.h"
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
 #include "hardware/timer.h"
@@ -31,14 +31,20 @@
 #include "hardware/uart.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "hardware/watchdog.h"
 #include "hardware/pwm.h"
 #include "hardware/vreg.h"
 
 #include "tusb.h"
-#include "bsp/board.h"
+// NOTE: bsp/board.h is intentionally NOT included — board_init() forces the
+// clock back to 120MHz which breaks PicoDVI at 252MHz.
 #include "hidparser/hidparser.h"
 
-#include "vga16_graphics.h"
+#include "dvi_adapter.h"
+#include "nunchuck.h"
+#include "nes_controller.h"
+#include "sd_loader.h"
+#include "fatfs/ff.h"
 #include "tms9918/vrEmuTms9918.h"
 #include "tms9918/vrEmuTms9918Util.h"
 
@@ -53,32 +59,16 @@
 #ifdef USE_OPLL
 #include "emu2413/emu2413.h"
 #endif
-#ifdef USE_I2S
-#include "audio_i2s.pio.h"
-#endif
-
 #include "lfs.h"
 #include "fdc.h"
 
-// VGAout configuration
+// DVI output at 252MHz (required by PicoDVI for 640x480p60Hz)
+#define SYSCLOCK_KHZ 252000
 
-#define DOTCLOCK 25000
-#ifdef USE_MORE_OVERCLOCK
-#define CLOCKMUL 10     // This is highly overclockd. it may cause unstable behavier.
-#else
-#define CLOCKMUL 9
-#endif
-// Pico does not work at CLOCKMUL=7 (175MHz).
-
-#define VGA_PIXELS_X 320
-#define VGA_PIXELS_Y 200
-
+// MSX screen dimensions used for menu/text rendering (40 chars × 24 rows)
 #define VGA_CHARS_X 40
 #define VGA_CHARS_Y 24
 
-#define VRAM_PAGE_SIZE (VGA_PIXELS_X*VGA_PIXELS_Y/8)
-
-extern unsigned char vga_data_array[];
 volatile uint8_t fbcolor,cursor_x,cursor_y,video_mode;
 
 volatile uint32_t video_hsync,video_vsync,scanline,vsync_scanline;
@@ -116,8 +106,11 @@ uint32_t cart_enable[2]={0,0};
 uint32_t cart_loaded[2]={0,0};
 
 
-// VDP
-VrEmuTms9918 *mainscreen,*menuscreen;
+// VDP — heap-allocated via vrEmuTms9918New().
+// TMDS buffers are now static (in dvi_adapter.c), so the heap has ~42KB free
+// for these two instances (~33KB combined) plus runtime file caches.
+VrEmuTms9918 *mainscreen;
+VrEmuTms9918 *menuscreen;
 uint8_t scandata[256];
 
 uint8_t timer_enable_irq=0;
@@ -170,9 +163,13 @@ uint16_t __attribute__  ((aligned(256)))  i2s_buffer1[I2S_NUMSAMPLES*2];
 uint32_t i2s_active_dma=0;
 uint i2s_chan_0 = 3;
 uint i2s_chan_1 = 4;
-PSG *msxpsg;
-SCC *msxscc1;
-SCC *msxscc2;
+// Static audio chip instances — avoid heap allocation for PSG/SCC structs
+static PSG _psg_inst;
+static SCC _scc1_inst;
+static SCC _scc2_inst;
+PSG *msxpsg  = &_psg_inst;
+SCC *msxscc1 = &_scc1_inst;
+SCC *msxscc2 = &_scc2_inst;
 #ifdef USE_OPLL
 OPLL *msxopll;
 #endif
@@ -239,13 +236,19 @@ uint8_t hid_led;
 #define USB_CHECK_INTERVAL 30 // 31.5us*30=1ms
 
 // Define the flash sizes
-// This is the setup to read a block of the flash from the end 
-#define BLOCK_SIZE_BYTES (FLASH_SECTOR_SIZE)
-#define HW_SYSTEM_RESERVED  512     // 512KiB for System reserved
+// This is the setup to read a block of the flash from the end
+// HW_SYSTEM_RESERVED is defined in msxemulator.h (1024 KiB for DVI port, was 512 KiB)
+// Use 64KB block erase size to match the W25Q128 block-erase opcode (0xD8).
+// The board has defective sectors where 4KB sector erase (0x20) hangs forever
+// (WIP bit never clears).  flash_range_erase with a 64KB-aligned count uses
+// the 0xD8 block erase which is reliable on all tested blocks.
+// LFS partition: 1MB / 64KB = 16 blocks (down from 256 4KB-blocks).
+// Changing this invalidates existing LFS data — firmware auto-reformats on boot.
+#define BLOCK_SIZE_BYTES (65536)
 // Use the outcome of HW_FLASH_STORAGE_BYTES for creating the little file system
-// Example calculation when using 2MB FLASH as defined in msxemulator.h ->  ((2 * 1024) - 512) * 1024 = 1572864
+// Example: 2MB flash, 1024KiB reserved -> (2048-1024)*1024 = 1MB LFS
 #define HW_FLASH_STORAGE_BYTES  (((HW_FLASH_STORAGE_MEGABYTES * 1024) - HW_SYSTEM_RESERVED) * 1024)
-#define HW_FLASH_STORAGE_BASE   (1024*1024*HW_FLASH_STORAGE_MEGABYTES - HW_FLASH_STORAGE_BYTES) 
+#define HW_FLASH_STORAGE_BASE   (1024*1024*HW_FLASH_STORAGE_MEGABYTES - HW_FLASH_STORAGE_BYTES)
 
 uint8_t __attribute__  ((aligned(sizeof(unsigned char *)*4096))) flash_buffer[4096];
 
@@ -269,64 +272,21 @@ static inline unsigned char tohex(int);
 static inline unsigned char fromhex(int);
 static inline void video_print(uint8_t *);
 
-// *REAL* H-Sync for emulation
-void __not_in_flash_func(hsync_handler)(void) {
+// HSync callback — replaces the old VGA PIO interrupt handler.
+// Fires every 64µs via repeating_timer, pacing the Z80 emulation.
+// 262 ticks × 64µs = 16.768ms ≈ 59.6Hz (NTSC), which closely matches
+// the DVI 60Hz frame period (16.67ms).  Using 313 (PAL 50Hz) leaves a
+// 3.3ms gap each DVI frame where the display shows solid-red error lines.
+static uint32_t _hsync_count = 0;
 
-    uint32_t vramindex;
-    uint32_t tmsscan;
-    uint8_t bgcolor;
-
-    pio_interrupt_clear(pio0, 0);
-
-    if((scanline!=0)&&(gpio_get(1)==0)) { // VSYNC
-        scanline=0;
-        video_vsync=1;
-    } else {
-        scanline++;
+bool __not_in_flash_func(hsync_cb)(struct repeating_timer *t) {
+    _hsync_count++;
+    if (_hsync_count >= 262) {  // 262 lines × 64µs ≈ 16.77ms → ~60Hz NTSC
+        _hsync_count = 0;
+        video_vsync = 1;
     }
-
-    if((scanline%2)==0) {
-        video_hsync=1;
-
-        // VDP Draw on HSYNC
-
-        // VGA Active starts scanline 35
-        // TMS9918 Active scanline 75(0) to 474(199)
-
-        if(scanline==78) {
-            if(menumode==0) {
-                bgcolor=vrEmuTms9918RegValue(mainscreen,TMS_REG_FG_BG_COLOR) & 0x0f;
-            } else {
-                bgcolor=vrEmuTms9918RegValue(menuscreen,TMS_REG_FG_BG_COLOR) & 0x0f;
-            }
-            memset(vga_data_array+320*4,colors[bgcolor],320);
-        }
-
-//        if((scanline>=75)&&(scanline<=456)) {
-        if((scanline>=81)&&(scanline<=464)) {
-
-            tmsscan=(scanline-81)/2;
-            if(menumode==0) {
-                vrEmuTms9918ScanLine(mainscreen,tmsscan,scandata);
-                bgcolor=vrEmuTms9918RegValue(mainscreen,TMS_REG_FG_BG_COLOR) & 0x0f;
-            } else {
-                vrEmuTms9918ScanLine(menuscreen,tmsscan,scandata);
-                bgcolor=vrEmuTms9918RegValue(menuscreen,TMS_REG_FG_BG_COLOR) & 0x0f;
-            }
-            vramindex=(tmsscan%4)*320;
-
-            memset(vga_data_array+(tmsscan%4)*320,colors[bgcolor],32);
-            memset(vga_data_array+(tmsscan%4)*320+32+256,colors[bgcolor],32);
-
-            for(int j=0;j<256;j++) {
-                vga_data_array[vramindex+j+32]=colors[scandata[j]];
-            }           
-        }
-
-    }
-
-    return;
-
+    video_hsync = 1;
+    return true;
 }
 
 // BEEP and PSG emulation
@@ -1078,6 +1038,114 @@ int draw_files(int num_selected,int page) {
 
 }
 
+// SD card file browser — lists *.rom files from the SD root directory.
+// Returns number of matching files found; copies selected filename to out_name.
+static int sd_draw_files(int num_selected, int page, char *out_name) {
+    FILINFO fno;
+    DIR dir;
+    unsigned char str[22];
+    int num_entry = 0;
+
+    // Clear the file list area
+    for (int i = 0; i < LFS_LS_FILES; i++) {
+        cursor_x = 20;
+        cursor_y = i + 3;
+        fbcolor = 7;
+        video_print("  ");
+    }
+
+    if (f_findfirst(&dir, &fno, "/msx", "*.rom") != FR_OK &&
+        f_findfirst(&dir, &fno, "/msx", "*.ROM") != FR_OK) {
+        f_closedir(&dir);
+        return 0;
+    }
+
+    while (fno.fname[0]) {
+        if (num_entry >= LFS_LS_FILES * page &&
+            num_entry <  LFS_LS_FILES * (page + 1)) {
+
+            cursor_x = 23;
+            cursor_y = num_entry % LFS_LS_FILES + 3;
+
+            if (num_entry == num_selected) {
+                if (out_name) strncpy(out_name, fno.fname, 64);
+                fbcolor = 0;  // highlight selected
+            } else {
+                fbcolor = 7;
+            }
+
+            snprintf((char *)str, sizeof(str), "%-17s", fno.fname);
+            video_print(str);
+
+            if (num_selected >= 0) {
+                cursor_x = 20;
+                cursor_y = (num_selected % LFS_LS_FILES) + 3;
+                video_print("->");
+            }
+        }
+
+        num_entry++;
+
+        if (f_findnext(&dir, &fno) != FR_OK) break;
+    }
+
+    f_closedir(&dir);
+
+    // Page indicator
+    cursor_x = 28;
+    cursor_y = 23;
+    fbcolor = 7;
+    snprintf((char *)str, sizeof(str), "SD Pg%02d", page + 1);
+    video_print(str);
+
+    return num_entry;
+}
+
+// Browse SD card .rom files and select one.
+// Returns 0 on selection (path written to out_path), -1 on cancel/empty.
+static int sd_file_selector(char *out_path, int path_size) {
+    uint32_t num_selected = 0;
+    int num_files = sd_draw_files(-1, 0, NULL);
+
+    if (num_files <= 0) return -1;
+
+    while (1) {
+        while (video_vsync == 0) ;
+        video_vsync = 0;
+        dvi_adapter_set_screen(menuscreen);
+
+        sd_draw_files(num_selected, num_selected / LFS_LS_FILES, out_path);
+
+        tuh_task();
+
+        if (keypressed == 0x52) {  // up
+            keypressed = 0;
+            if (num_selected > 0) num_selected--;
+        }
+        if (keypressed == 0x51) {  // down
+            keypressed = 0;
+            if (num_selected < (uint32_t)(num_files - 1)) num_selected++;
+        }
+        if (keypressed == 0x4b) {  // page up
+            keypressed = 0;
+            if (num_selected >= LFS_LS_FILES) num_selected -= LFS_LS_FILES;
+        }
+        if (keypressed == 0x4e) {  // page down
+            keypressed = 0;
+            if (num_selected < (uint32_t)(num_files - LFS_LS_FILES))
+                num_selected += LFS_LS_FILES;
+        }
+        if (keypressed == 0x28) {  // Enter — confirm
+            keypressed = 0;
+            return 0;
+        }
+        if (keypressed == 0x29) {  // ESC — cancel
+            keypressed = 0;
+            return -1;
+        }
+    }
+}
+
 int file_selector(void) {
 
     uint32_t num_selected=0;
@@ -1094,6 +1162,7 @@ int file_selector(void) {
 
         while(video_vsync==0) ;
         video_vsync=0;
+        dvi_adapter_set_screen(menuscreen);
 
         draw_files(num_selected,num_selected/LFS_LS_FILES);
 
@@ -1160,6 +1229,7 @@ int enter_filename() {
 
         while(video_vsync==0) ;
         video_vsync=0;
+        dvi_adapter_set_screen(menuscreen);
 
         tuh_task();
 
@@ -1301,25 +1371,21 @@ int pico_prog(const struct lfs_config *c, lfs_block_t block, lfs_off_t off, cons
 //    printf("[FS] WRITE: %p, %d\n", addr, size);
         
     uint32_t ints = save_and_disable_interrupts();
-    multicore_lockout_start_blocking();     // pause another core
     flash_range_program(addr, (const uint8_t *)buffer, size);
-    multicore_lockout_end_blocking();
     restore_interrupts(ints);
-        
+
     return 0;
 }
 
 int pico_erase(const struct lfs_config *c, lfs_block_t block)
-{           
+{
     uint32_t fs_start = HW_FLASH_STORAGE_BASE;
     uint32_t offset = fs_start + (block * c->block_size);
-    
+
 //    printf("[FS] ERASE: %p, %d\n", offset, block);
-        
-    uint32_t ints = save_and_disable_interrupts();   
-    multicore_lockout_start_blocking();     // pause another core
-    flash_range_erase(offset, c->block_size);  
-    multicore_lockout_end_blocking();
+
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(offset, c->block_size);
     restore_interrupts(ints);
 
     return 0;
@@ -1331,6 +1397,11 @@ int pico_sync(const struct lfs_config *c)
 }
 
 // configuration of the filesystem is provided by this struct
+// Static LFS cache buffers — avoids lfs_malloc calls at mount time.
+static uint8_t _lfs_read_buf[FLASH_PAGE_SIZE];
+static uint8_t _lfs_prog_buf[FLASH_PAGE_SIZE];
+static uint8_t _lfs_lookahead_buf[FLASH_PAGE_SIZE];
+
 const struct lfs_config PICO_FLASH_CFG = {
     // block device operations
     .read  = &pico_read,
@@ -1341,13 +1412,18 @@ const struct lfs_config PICO_FLASH_CFG = {
     // block device configuration
     .read_size = FLASH_PAGE_SIZE, // 256
     .prog_size = FLASH_PAGE_SIZE, // 256
-    
+
     .block_size = BLOCK_SIZE_BYTES, // 4096
     .block_count = HW_FLASH_STORAGE_BYTES / BLOCK_SIZE_BYTES, // 352
     .block_cycles = 16, // ?
-    
+
     .cache_size = FLASH_PAGE_SIZE, // 256
-    .lookahead_size = FLASH_PAGE_SIZE,   // 256    
+    .lookahead_size = FLASH_PAGE_SIZE,   // 256
+
+    // Static buffers — no malloc needed at mount
+    .read_buffer      = _lfs_read_buf,
+    .prog_buffer      = _lfs_prog_buf,
+    .lookahead_buffer = _lfs_lookahead_buf,
 };
 
 // Keyboard
@@ -1441,18 +1517,13 @@ void process_kbd_report(hid_keyboard_report_t const *report) {
 
 // cart slots 
 
-void cart_type_checker(uint8_t cartno) {
+void cart_type_checker(uint8_t cartno, uint32_t cartsize) {
 
     // check cart type on flash
+    printf("[CTC] cartno=%d cartsize=%lu\n", (int)cartno, (unsigned long)cartsize);
 
-    uint32_t hists[8],cartsize,candidate_count;
+    uint32_t hists[8],candidate_count;
     uint8_t param,candidate;
-
-    if(cartno==0) {
-        cartsize=lfs_file_size(&lfs,&lfs_cart1);        
-    } else {
-        cartsize=lfs_file_size(&lfs,&lfs_cart2);
-    }
 
 //    printf("[Cart %d type %d]",cartno,cartsize);
 
@@ -1581,9 +1652,9 @@ int32_t cart_compare(uint32_t cartno) {
     int32_t match;
 
     if(cartno==0) {
-//        lfs_file_rewind(&lfs,&lfs_cart1);
         filesize=lfs_file_size(&lfs,&lfs_cart1);
-//                printf("[Cart1 compare %d bytes]\n",filesize);
+        printf("[CMP0] %ld bytes vs flash@%08lx\n", (long)filesize, (unsigned long)CART1BASE);
+        uart_tx_wait_blocking(uart1);
         lfs_file_rewind(&lfs,&lfs_cart1);
         match=0;
         for(int i=0;i<filesize;i++) {
@@ -1592,11 +1663,14 @@ int32_t cart_compare(uint32_t cartno) {
                 match=-1;
             }
         }
-//        cart_type_checker(0,filesize);
+        printf("[CMP0] result=%ld (%s)\n", (long)match, match ? "need write" : "already ok");
+        uart_tx_wait_blocking(uart1);
         return match;
 
     } else {
-        filesize=lfs_file_size(&lfs,&lfs_cart2); 
+        filesize=lfs_file_size(&lfs,&lfs_cart2);
+        printf("[CMP1] %ld bytes vs flash@%08lx\n", (long)filesize, (unsigned long)CART2BASE);
+        uart_tx_wait_blocking(uart1);
         lfs_file_rewind(&lfs,&lfs_cart2);
         match=0;
         for(int i=0;i<filesize;i++) {
@@ -1605,79 +1679,112 @@ int32_t cart_compare(uint32_t cartno) {
                 match=-1;
             }
         }
-//        cart_type_checker(1,filesize);
+        printf("[CMP1] result=%ld (%s)\n", (long)match, match ? "need write" : "already ok");
+        uart_tx_wait_blocking(uart1);
         return match;
     }
 
 }
 
+// Flash a ROM file from SD directly to a cart slot, before core1 starts.
+// sd_full_path: full FatFs path e.g. "/msx/GAME.ROM"
+// cart_base_addr: XIP address of the cart slot (CART1BASE or CART2BASE)
+// Returns ROM byte size on success, 0 on failure.
+static uint32_t flash_rom_from_sd(const char *sd_full_path, uint32_t cart_base_addr) {
+    FIL fil;
+    if (f_open(&fil, sd_full_path, FA_READ) != FR_OK) {
+        printf("[BOOT] cannot open %s\n", sd_full_path);
+        uart_tx_wait_blocking(uart1);
+        return 0;
+    }
+    FSIZE_t filesize = f_size(&fil);
+    if (filesize == 0 || filesize > 262144u) {
+        printf("[BOOT] bad ROM size %lu\n", (unsigned long)filesize);
+        uart_tx_wait_blocking(uart1);
+        f_close(&fil);
+        return 0;
+    }
+
+    uint32_t flash_off = cart_base_addr - XIP_BASE;
+    uint32_t erase_size = ((uint32_t)filesize + 65535u) & ~65535u;
+    printf("[BOOT] %s → 0x%08lx (%lu B)\n",
+           sd_full_path, (unsigned long)cart_base_addr, (unsigned long)filesize);
+    uart_tx_wait_blocking(uart1);
+    {
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(flash_off, erase_size);
+        restore_interrupts(ints);
+    }
+
+    UINT br;
+    watchdog_enable(1000, false);
+    uint32_t ofs = flash_off;
+    for (;;) {
+        memset(flash_buffer, 0xFF, 4096);
+        f_read(&fil, flash_buffer, 4096, &br);
+        if (br == 0) break;
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_program(ofs, flash_buffer, 4096);
+        restore_interrupts(ints);
+        watchdog_update();
+        printf(".");
+        uart_tx_wait_blocking(uart1);
+        ofs += 4096;
+    }
+    watchdog_disable();
+    printf(" done\n");
+    uart_tx_wait_blocking(uart1);
+    f_close(&fil);
+    return (uint32_t)filesize;
+}
+
 void cart_write(uint32_t cartno) {
 
     int32_t filesize;
+    uint32_t flash_off;
 
-    if(cartno==0) {
-  //      lfs_file_rewind(&lfs,&lfs_cart1);
-        filesize=lfs_file_size(&lfs,&lfs_cart1);
-        lfs_file_rewind(&lfs,&lfs_cart1);
-
-        // printf("[Cart1 flash %d bytes]\n",filesize);
-        // printf("[Cart1 erasing]\n");
-
-        for(int i=0;i<filesize;i+=4096) {
-            uint32_t ints = save_and_disable_interrupts();   
-            multicore_lockout_start_blocking();     // pause another core
-            flash_range_erase(i+0x40000, 4096);  
-            multicore_lockout_end_blocking();
-            restore_interrupts(ints);
-        }
-
-        // printf("[Cart1 writing]\n");
-
-        for(int i=0;i<filesize;i+=4096) {
-
-            lfs_file_read(&lfs,&lfs_cart1,&flash_buffer,4096);
-            uint32_t ints = save_and_disable_interrupts();
-            multicore_lockout_start_blocking();     // pause another core
-            flash_range_program(i+0x40000, (const uint8_t *)flash_buffer, 4096);
-            multicore_lockout_end_blocking();
-            restore_interrupts(ints);
-
-        }
-
-        // printf("[Cart1 load done]\n");
-
+    if (cartno == 0) {
+        filesize  = lfs_file_size(&lfs, &lfs_cart1);
+        lfs_file_rewind(&lfs, &lfs_cart1);
+        flash_off = CART1BASE - XIP_BASE;
     } else {
-
-        filesize=lfs_file_size(&lfs,&lfs_cart2);
-        lfs_file_rewind(&lfs,&lfs_cart2);
-
-        // printf("[Cart1 flash %d bytes]\n",filesize);
-        // printf("[Cart1 erasing]\n");
-
-        for(int i=0;i<filesize;i+=4096) {
-            uint32_t ints = save_and_disable_interrupts();   
-            multicore_lockout_start_blocking();     // pause another core
-            flash_range_erase(i+0x60000, 4096);  
-            multicore_lockout_end_blocking();
-            restore_interrupts(ints);
-        }
-
-        // printf("[Cart1 writing]\n");
-
-        for(int i=0;i<filesize;i+=4096) {
-
-            lfs_file_read(&lfs,&lfs_cart2,&flash_buffer,4096);
-            uint32_t ints = save_and_disable_interrupts();
-            multicore_lockout_start_blocking();     // pause another core
-            flash_range_program(i+0x60000, (const uint8_t *)flash_buffer, 4096);
-            multicore_lockout_end_blocking();
-            restore_interrupts(ints);
-
-        }
-
+        filesize  = lfs_file_size(&lfs, &lfs_cart2);
+        lfs_file_rewind(&lfs, &lfs_cart2);
+        flash_off = CART2BASE - XIP_BASE;
     }
 
-    return;
+    if (filesize <= 0) return;
+
+    // Bulk 64KB block erase — avoids per-sector 4KB erase hangs on marginal flash cells.
+    uint32_t erase_size = ((uint32_t)filesize + 65535u) & ~65535u;
+    printf("[CW%lu] erase 0x%06lx+0x%05lx\n",
+           (unsigned long)cartno, (unsigned long)flash_off, (unsigned long)erase_size);
+    uart_tx_wait_blocking(uart1);
+    {
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(flash_off, erase_size);
+        restore_interrupts(ints);
+    }
+    printf("[CW%lu] erase done, prog ", (unsigned long)cartno);
+    uart_tx_wait_blocking(uart1);
+
+    // Watchdog: reboot if flash_range_program stalls on a defective page.
+    watchdog_enable(1000, false);
+    for (int i = 0; i < filesize; i += 4096) {
+        if (cartno == 0)
+            lfs_file_read(&lfs, &lfs_cart1, &flash_buffer, 4096);
+        else
+            lfs_file_read(&lfs, &lfs_cart2, &flash_buffer, 4096);
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_program(flash_off + i, (const uint8_t *)flash_buffer, 4096);
+        restore_interrupts(ints);
+        watchdog_update();
+        printf(".");
+        uart_tx_wait_blocking(uart1);
+    }
+    watchdog_disable();
+    printf(" done\n");
+    uart_tx_wait_blocking(uart1);
 
 }
 
@@ -2163,7 +2270,16 @@ static uint8_t io_read(void *context, uint16_t address)
                         if(tapein()) b|=0x80;
                     }
                     if(!gamepad_select) {
-                        b|=gamepad_info;
+                        uint32_t nc = nunchuck_joy_bits | nes_joy_bits;
+                        uint8_t joy = gamepad_info;
+                        // Active-high bits (nunchuck/NES) → PSG active-low bits
+                        if (nc & 0x0004) joy &= ~0x01u;  // up    → bit0
+                        if (nc & 0x0008) joy &= ~0x02u;  // down  → bit1
+                        if (nc & 0x0001) joy &= ~0x04u;  // left  → bit2
+                        if (nc & 0x0002) joy &= ~0x08u;  // right → bit3
+                        if (nc & 0x0010) joy &= ~0x10u;  // fire A → bit4
+                        if (nc & 0x0040) joy &= ~0x20u;  // fire B → bit5
+                        b |= joy;
                     } else {
                         b|=0x3f;
                     }
@@ -2402,14 +2518,15 @@ void i2s_init(void){
 
     // Initialize sound chips
 
-    msxpsg = PSG_new(3579545/2, SAMPLING_FREQ);
+    // Static instances — initialise in place instead of malloc + New()
+    PSG_init(msxpsg, 3579545/2, SAMPLING_FREQ);
     PSG_setVolumeMode(msxpsg, 2);
     PSG_reset(msxpsg);
 
-    msxscc1 = SCC_new(3579545, SAMPLING_FREQ); 
+    SCC_init(msxscc1, 3579545, SAMPLING_FREQ);
     SCC_reset(msxscc1);
 
-    msxscc2 = SCC_new(3579545, SAMPLING_FREQ); 
+    SCC_init(msxscc2, 3579545, SAMPLING_FREQ);
     SCC_reset(msxscc2);
 
 #ifdef USE_OPLL
@@ -2548,36 +2665,7 @@ void init_emulator(void) {
 
 }
 
-void main_core1(void) {
-
-    uint8_t bgcolor;
-    uint32_t vramindex;
-
-    multicore_lockout_victim_init();
-
-    scanline=0;
-
-    // set Hsync timer
-
-#ifndef USE_OPLL
-    irq_set_exclusive_handler (PIO0_IRQ_0, hsync_handler);
-    irq_set_enabled(PIO0_IRQ_0, true);
-    pio_set_irq0_source_enabled (pio0, pis_interrupt0 , true);
-#endif
-
-    // set PSG timer
-    // Use polling insted for I2S mode
-
-    // add_repeating_timer_us(1000000/SAMPLING_FREQ,sound_handler,NULL  ,&timer2);
-
-    while(1) { 
-
-#ifdef USE_I2S
-        i2s_process();
-#endif
-
-    }
-}
+// main_core1 removed — core1 is now used by dvi_adapter for PicoDVI scan loop.
 
 int main() {
 
@@ -2587,59 +2675,88 @@ int main() {
 
     static uint32_t hsync_wait,vsync_wait;
 
-#ifdef USE_CORE_VOLTAGE12
+    // ROM sizes discovered pre-core1 (>0 means a ROM was found / flashed).
+    uint32_t boot_rom_size[2] = {0, 0};
 
+    // 1. Core voltage + clock — must be done before stdio/DVI init.
+    //    board_init() is intentionally NOT called (it resets clock to 120MHz).
     vreg_set_voltage(VREG_VOLTAGE_1_20);
-
-#endif
-
-    set_sys_clock_khz(DOTCLOCK * CLOCKMUL ,true);
+    sleep_ms(10);
+    set_sys_clock_khz(SYSCLOCK_KHZ, true);
+    sleep_ms(10);
 
     stdio_init_all();
 
-    uart_init(uart0, 115200);
+    // 2. UART on GPIO4/5 via uart1 (RP2040-PiZero; was GPIO12/13 uart0)
+    uart_init(uart1, 9600);
+    gpio_set_function(4, GPIO_FUNC_UART);   // TX
+    gpio_set_function(5, GPIO_FUNC_UART);   // RX
 
-    initVGA();
+    // 3. SD card — init before DVI so we can flash ROMs before core1 starts.
+    sd_init();
 
-    gpio_set_function(12, GPIO_FUNC_UART);
-    gpio_set_function(13, GPIO_FUNC_UART);
+    // Pre-core1 ROM flash: core1 (DVI) is not running yet, so XIP is safe to
+    // disable for flash_range_erase / flash_range_program.
+    // SELROM1 / SELROM2 on the SD card hold the full path of the last ROM
+    // selected in the menu (e.g. "/msx/GAME.ROM").
+    // On watchdog reboot (triggered by menu): stream ROM from SD to flash.
+    // On hardware / power-on reset: ROM already in flash — just read size.
+    {
+        static const char * const selrom_files[2] = { "/msx/SELROM1", "/msx/SELROM2" };
+        static const uint32_t cart_bases[2] = { CART1BASE, CART2BASE };
+        bool watchdog_boot = watchdog_enable_caused_reboot();
 
-    // gpio_set_slew_rate(0,GPIO_SLEW_RATE_FAST);
-    // gpio_set_slew_rate(1,GPIO_SLEW_RATE_FAST);
-    // gpio_set_slew_rate(2,GPIO_SLEW_RATE_FAST);
-    // gpio_set_slew_rate(3,GPIO_SLEW_RATE_FAST);
-    // gpio_set_slew_rate(4,GPIO_SLEW_RATE_FAST);
+        for (int slot = 0; slot < 2; slot++) {
+            char rompath[80] = {0};
+            UINT br;
+            FIL f;
+            if (f_open(&f, selrom_files[slot], FA_READ) == FR_OK) {
+                f_read(&f, rompath, sizeof(rompath) - 1, &br);
+                f_close(&f);
+                rompath[br] = '\0';
+                while (br > 0 && (rompath[br-1] == '\n' || rompath[br-1] == '\r'))
+                    rompath[--br] = '\0';
+            }
+            if (rompath[0] == '\0') continue;
 
-    gpio_set_drive_strength(2,GPIO_DRIVE_STRENGTH_2MA);
-    gpio_set_drive_strength(3,GPIO_DRIVE_STRENGTH_2MA);
-    gpio_set_drive_strength(4,GPIO_DRIVE_STRENGTH_2MA);
-    gpio_set_drive_strength(5,GPIO_DRIVE_STRENGTH_2MA);
-    gpio_set_drive_strength(6,GPIO_DRIVE_STRENGTH_2MA);
-    gpio_set_drive_strength(7,GPIO_DRIVE_STRENGTH_2MA);
-    gpio_set_drive_strength(8,GPIO_DRIVE_STRENGTH_2MA);
-    gpio_set_drive_strength(9,GPIO_DRIVE_STRENGTH_2MA);
+            printf("[BOOT] slot%d path=%s watchdog=%d\n", slot, rompath, (int)watchdog_boot);
+            uart_tx_wait_blocking(uart1);
 
-#ifdef USE_I2S
-    i2s_init();
-    i2s_dma_init();
-#else
-    // Beep & PSG
+            if (watchdog_boot) {
+                boot_rom_size[slot] = flash_rom_from_sd(rompath, cart_bases[slot]);
+            } else {
+                // ROM already in flash — open SD file only to get its size.
+                FIL sf;
+                if (f_open(&sf, rompath, FA_READ) == FR_OK) {
+                    boot_rom_size[slot] = (uint32_t)f_size(&sf);
+                    f_close(&sf);
+                }
+            }
+        }
+    }
 
-    gpio_set_function(10,GPIO_FUNC_PWM);
- //   gpio_set_function(11,GPIO_FUNC_PWM);
-    pwm_slice_num = pwm_gpio_to_slice_num(10);
+    // 4. DVI init — launches core1, claims pio0 and DMA channels 0-5
+    dvi_adapter_init();
+
+    // 4b. Nunchuck I2C joystick on I2C1/GPIO2+3
+    nunchuck_init();
+
+    // 4b2. NES controller on GPIO10/11/12
+    nes_init();
+
+    // 4. PWM audio on GPIO6 (RP2040-PiZero; was GPIO10)
+    gpio_set_function(6, GPIO_FUNC_PWM);
+    pwm_slice_num = pwm_gpio_to_slice_num(6);
 
     pwm_set_wrap(pwm_slice_num, 256);
     pwm_set_chan_level(pwm_slice_num, PWM_CHAN_A, 0);
-//    pwm_set_chan_level(pwm_slice_num, PWM_CHAN_B, 0);
     pwm_set_enabled(pwm_slice_num, true);
 
-    // set PSG timer
+    // 5. PSG/sound timer
+    add_repeating_timer_us(1000000/SAMPLING_FREQ, sound_handler, NULL, &timer2);
 
-    add_repeating_timer_us(1000000/SAMPLING_FREQ,sound_handler,NULL  ,&timer2);
-#endif
-
-    tuh_init(BOARD_TUH_RHPORT);
+    // 6. USB host (hardware USB on GPIO15/16, no PIO-USB needed)
+    tuh_init(0);
 
 
 //    video_cls();
@@ -2656,18 +2773,9 @@ int main() {
     // irq_set_enabled(UART0_IRQ,true);
     // uart_set_irq_enables(uart0,true,false);
 
-    multicore_launch_core1(main_core1);
-    multicore_lockout_victim_init();
-
-    sleep_ms(1);
-
-#ifdef USE_OPLL
-    // set Hsync timer
-
-    irq_set_exclusive_handler (PIO0_IRQ_0, hsync_handler);
-    irq_set_enabled(PIO0_IRQ_0, true);
-    pio_set_irq0_source_enabled (pio0, pis_interrupt0 , true);
-#endif
+    // HSync repeating timer — replaces the old VGA PIO0_IRQ_0 handler.
+    // Fires every 64µs to pace Z80 execution; accumulates into VSync at 262 ticks.
+    add_repeating_timer_us(-64, hsync_cb, NULL, &timer);
 
 // mount littlefs
     if(lfs_mount(&lfs,&PICO_FLASH_CFG)!=0) {
@@ -2680,10 +2788,21 @@ int main() {
        lfs_mount(&lfs,&PICO_FLASH_CFG);
    }
 
-    mainscreen=vrEmuTms9918New();
-    menuscreen=vrEmuTms9918New();
+    mainscreen = vrEmuTms9918New();
+    menuscreen = vrEmuTms9918New();
+    // Enable DVI display now that mainscreen is valid.
+    dvi_adapter_set_screen(mainscreen);
 
     menuinit();
+
+    // Apply cart state for any ROM that was already in flash at boot time.
+    for (int slot = 0; slot < 2; slot++) {
+        if (boot_rom_size[slot] > 0) {
+            cart_type_checker(slot, boot_rom_size[slot]);
+            cart_loaded[slot] = 1;
+            cart_enable[slot] = 1;
+        }
+    }
 
     menumode=1;  // Pause emulator
 
@@ -2751,12 +2870,18 @@ int main() {
             }
         }
 
-        if(video_vsync==1) { // Timer
+        if(video_vsync==1) { // VBlank
+            // Tell core1 which screen to render (non-blocking).
+            VrEmuTms9918 *screen = (menumode == 0) ? mainscreen : menuscreen;
+            dvi_adapter_set_screen(screen);
+
+            nunchuck_poll();
+            nes_poll();
             tuh_task();
             process_kbd_leds();
             video_vsync=2;
-            vsync_scanline=scanline;
-      
+            vsync_scanline=_hsync_count;
+
             if((tape_autoclose)&&(save_enabled==2)) {
                 if((cpu_cycles-tape_cycles)>TAPE_THRESHOLD) {
                     save_enabled=0;
@@ -2967,14 +3092,52 @@ int main() {
 // //                 sprintf(str,"%04x",Z80_PC(cpu));
 //                  video_print(str);
 
+            static int dbg_vsync = 0;
             if(filelist==0) {
+                printf("[MENU] draw_files start\n");
                 draw_files(-1,0);
+                printf("[MENU] draw_files done\n");
                 filelist=1;
+                dbg_vsync = 5;  // print next 5 vsync iterations
             }
-     
-            while(video_vsync==0);
+
+            if(dbg_vsync) {
+                printf("[MENU] pre-vsync vsync=%d mode=%d key=%d stall=%lu\n",
+                       (int)video_vsync, (int)menumode, (int)keypressed,
+                       (unsigned long)dvi_stall_count);
+                uart_tx_wait_blocking(uart1);
+            }
+            // Timeout-guarded vsync wait: if vsync doesn't fire within ~100ms,
+            // report it so we can detect a stopped timer.
+            {
+                uint32_t t0 = time_us_32();
+                while(video_vsync==0) {
+                    if ((time_us_32() - t0) > 100000u) {
+                        printf("[MENU] vsync TIMEOUT stall=%lu\n",
+                               (unsigned long)dvi_stall_count);
+                        uart_tx_wait_blocking(uart1);
+                        t0 = time_us_32();  // reset to keep printing if still stuck
+                    }
+                }
+            }
+            if(dbg_vsync) {
+                printf("[MENU] post-vsync stall=%lu\n",
+                       (unsigned long)dvi_stall_count);
+                if(dbg_vsync == 1) {
+                    // On last debug frame: dump TMS9918 state so we can check
+                    // whether the display is actually enabled.
+                    uint8_t r0 = vrEmuTms9918RegValue(menuscreen, TMS_REG_0);
+                    uint8_t r1 = vrEmuTms9918RegValue(menuscreen, TMS_REG_1);
+                    bool disp = vrEmuTms9918DisplayEnabled(menuscreen);
+                    printf("[MENU] TMS REG0=%02x REG1=%02x disp=%d screen=%p\n",
+                           r0, r1, (int)disp, (void*)menuscreen);
+                }
+                uart_tx_wait_blocking(uart1);
+                dbg_vsync--;
+            }
 
             video_vsync=0;
+            dvi_adapter_set_screen(menuscreen);
 
                 tuh_task();
 
@@ -3047,24 +3210,58 @@ int main() {
 
                     if(menuitem==2) { // Slot Load
 
-                        uint32_t res=file_selector();
-
-                        if(res==0) {
-                            memcpy(cart1_filename,filename,16);
-                            lfs_file_open(&lfs,&lfs_cart1,cart1_filename,LFS_O_RDONLY);
-                            if(cart_size_check(0)==0) {
-                                if(cart_compare(0)!=0) {
-                                    cart_write(0);
+                        if (sd_available()) {
+                            // SD card present — save ROM path and reboot.
+                            // flash_rom_from_sd() runs pre-core1 on the next boot.
+                            char sd_path[64] = {0};
+                            if (sd_file_selector(sd_path, sizeof(sd_path)) == 0) {
+                                char sd_full_path[80];
+                                snprintf(sd_full_path, sizeof(sd_full_path), "/msx/%s", sd_path);
+                                FIL fil;
+                                if (f_open(&fil, "/msx/SELROM1", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+                                    UINT bw;
+                                    f_write(&fil, sd_full_path, strlen(sd_full_path), &bw);
+                                    f_close(&fil);
                                 }
-                                cart_type_checker(0);
-                                cart_loaded[0]=1;
-                            } else {
-                                cart_loaded[0]=0;
+                                printf("[MENU] slot0 SELROM1=%s rebooting\n", sd_full_path);
+                                uart_tx_wait_blocking(uart1);
+                                watchdog_enable(1, 1);
+                                while (1);
                             }
-                            lfs_file_close(&lfs,&lfs_cart1);
+                        } else {
+                            // No SD card — fall back to LittleFS
+                            uint32_t res=file_selector();
+                            if(res==0) {
+                                memcpy(cart1_filename,filename,16);
+                                lfs_file_open(&lfs,&lfs_cart1,cart1_filename,LFS_O_RDONLY);
+                                if(cart_size_check(0)==0) {
+                                    if(cart_compare(0)!=0) {
+                                        cart_write(0);
+                                    }
+                                    cart_type_checker(0, (uint32_t)lfs_file_size(&lfs,&lfs_cart1));
+                                    cart_loaded[0]=1;
+                                    cart_enable[0]=1;
+                                } else {
+                                    cart_loaded[0]=0;
+                                }
+                                lfs_file_close(&lfs,&lfs_cart1);
+                            }
                         }
 
+                        // Reinitialise menuscreen: the SD file selector and flash
+                        // operations may have trashed the TMS9918 VRAM.
+                        menuinit();
                         menuprint=0;
+                        // Drain USB events and force display back to menu.
+                        // Flash ops hold interrupts off for up to 400ms; stale events
+                        // (e.g. a buffered F12) must be consumed before the menu loop
+                        // checks keypressed, otherwise menumode becomes 0 → black screen.
+                        tuh_task();
+                        keypressed = 0;
+                        // Belt-and-suspenders: force menu state regardless of what
+                        // any USB event or race may have done during flash ops.
+                        menumode = 1;
+                        dvi_adapter_set_screen(menuscreen);
                     }
 
                     if(menuitem==3) { // Cart enable/disable
@@ -3081,24 +3278,50 @@ int main() {
 
                     if(menuitem==5) { // Slot2 Load
 
-                        uint32_t res=file_selector();
-
-                        if(res==0) {
-                            memcpy(cart2_filename,filename,16);
-                            lfs_file_open(&lfs,&lfs_cart2,cart2_filename,LFS_O_RDONLY);
-                            if(cart_size_check(1)==0) {
-                                if(cart_compare(1)!=0) {
-                                    cart_write(1);
+                        if (sd_available()) {
+                            // SD card present — save ROM path and reboot.
+                            // flash_rom_from_sd() runs pre-core1 on the next boot.
+                            char sd_path[64] = {0};
+                            if (sd_file_selector(sd_path, sizeof(sd_path)) == 0) {
+                                char sd_full_path[80];
+                                snprintf(sd_full_path, sizeof(sd_full_path), "/msx/%s", sd_path);
+                                FIL fil;
+                                if (f_open(&fil, "/msx/SELROM2", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK) {
+                                    UINT bw;
+                                    f_write(&fil, sd_full_path, strlen(sd_full_path), &bw);
+                                    f_close(&fil);
                                 }
-                                cart_type_checker(1);
-                                cart_loaded[1]=1;
-                            }else {
-                                cart_loaded[1]=0;
+                                printf("[MENU] slot1 SELROM2=%s rebooting\n", sd_full_path);
+                                uart_tx_wait_blocking(uart1);
+                                watchdog_enable(1, 1);
+                                while (1);
                             }
-                            lfs_file_close(&lfs,&lfs_cart2);
+                        } else {
+                            // No SD card — fall back to LittleFS
+                            uint32_t res=file_selector();
+                            if(res==0) {
+                                memcpy(cart2_filename,filename,16);
+                                lfs_file_open(&lfs,&lfs_cart2,cart2_filename,LFS_O_RDONLY);
+                                if(cart_size_check(1)==0) {
+                                    if(cart_compare(1)!=0) {
+                                        cart_write(1);
+                                    }
+                                    cart_type_checker(1, (uint32_t)lfs_file_size(&lfs,&lfs_cart2));
+                                    cart_loaded[1]=1;
+                                    cart_enable[1]=1;
+                                } else {
+                                    cart_loaded[1]=0;
+                                }
+                                lfs_file_close(&lfs,&lfs_cart2);
+                            }
                         }
 
+                        menuinit();
                         menuprint=0;
+                        tuh_task();
+                        keypressed = 0;
+                        menumode = 1;
+                        dvi_adapter_set_screen(menuscreen);
                     }
 
                     if(menuitem==6) { // Cart enable/disable
@@ -3140,6 +3363,7 @@ int main() {
                             }
                         }
 
+                        menuinit();
                         menuprint=0;
 
                     }

@@ -67,36 +67,8 @@
 #define TMS_R1_SPRITE_16        0x02
 #define TMS_R1_SPRITE_MAG2      0x01
 
- /* PRIVATE DATA STRUCTURE
-  * ---------------------- */
-struct vrEmuTMS9918_s
-{
-  /* the eight write-only registers */
-  uint8_t registers[TMS_NUM_REGISTERS];
-
-  /* status register (read-only) */
-  uint8_t status;
-
-  /* current address for cpu access (auto-increments) */
-  uint16_t currentAddress;
-
-  /* address or register write stage (0 or 1) */
-  uint8_t regWriteStage;
-
-  /* holds first stage of write to address/register port */
-  uint8_t regWriteStage0Value;
-
-  /* buffered value */
-  uint8_t readAheadBuffer;
-
-  /* current display mode */
-  vrEmuTms9918Mode mode;
-
-  /* video ram */
-  uint8_t vram[VRAM_SIZE];
-
-  uint8_t rowSpriteBits[TMS9918_PIXELS_X]; /* collision mask */
-};
+ /* struct vrEmuTMS9918_s is defined in vrEmuTms9918.h (exposed for static allocation).
+  * VRAM_SIZE / VRAM_MASK used below for address masking. */
 
 
 /* Function:  tmsMode
@@ -476,27 +448,41 @@ static void __time_critical_func(vrEmuTms9918OutputSprites)(VrEmuTms9918* tms991
       endXPos = TMS9918_PIXELS_X;
     }
 
-    for (int16_t screenX = xPos; screenX < endXPos; ++screenX, ++screenBit)
-    {
-      if (screenX >= 0)
-      {
-        if (pattByte < 0)
-        {
-          if (spriteColor != TMS_TRANSPARENT && tms9918->rowSpriteBits[screenX] < 2)
-          {
-            pixels[screenX] = spriteColor;
-          }
+    int16_t screenX = xPos;
 
-          /* we still process transparent sprites, since
-             they're used in 5S and collision checks */
-          if (tms9918->rowSpriteBits[screenX])
-          {
-            tms9918->status |= STATUS_COL;
-          }
-          else
-          {
-            tms9918->rowSpriteBits[screenX] = spriteColor + 1;
-          }
+    /* Off-screen left: advance pattern bits without touching the pixel buffer. */
+    for (; screenX < 0 && screenX < endXPos; ++screenX, ++screenBit)
+    {
+      if (!spriteMag || (screenBit & 0x01))
+      {
+        pattByte <<= 1;
+        if (++pattBit == GRAPHICS_CHAR_WIDTH && sprite16)
+        {
+          pattBit = 0;
+          pattByte = tms9918->vram[pattOffset + PATTERN_BYTES * 2];
+        }
+      }
+    }
+
+    /* On-screen: screenX >= 0 guaranteed — no branch needed inside. */
+    for (; screenX < endXPos; ++screenX, ++screenBit)
+    {
+      if (pattByte < 0)
+      {
+        if (spriteColor != TMS_TRANSPARENT && tms9918->rowSpriteBits[screenX] < 2)
+        {
+          pixels[screenX] = spriteColor;
+        }
+
+        /* we still process transparent sprites, since
+           they're used in 5S and collision checks */
+        if (tms9918->rowSpriteBits[screenX])
+        {
+          tms9918->status |= STATUS_COL;
+        }
+        else
+        {
+          tms9918->rowSpriteBits[screenX] = spriteColor + 1;
         }
       }
 
@@ -504,7 +490,7 @@ static void __time_critical_func(vrEmuTms9918OutputSprites)(VrEmuTms9918* tms991
       if (!spriteMag || (screenBit & 0x01))
       {
         pattByte <<= 1;
-        if (++pattBit == GRAPHICS_CHAR_WIDTH && sprite16) /* from A -> C or B -> D of large sprite */
+        if (++pattBit == GRAPHICS_CHAR_WIDTH && sprite16)
         {
           pattBit = 0;
           pattByte = tms9918->vram[pattOffset + PATTERN_BYTES * 2];
@@ -542,13 +528,15 @@ static void __time_critical_func(vrEmuTms9918GraphicsIScanLine)(VrEmuTms9918* tm
     const uint8_t fgColor = tmsFgColor(tms9918, colorByte);
     const uint8_t bgColor = tmsBgColor(tms9918, colorByte);
 
-    /* iterate over each bit of this pattern byte */
-    for (uint8_t pattBit = 0; pattBit < GRAPHICS_CHAR_WIDTH; ++pattBit)
-    {
-      const bool pixelBit = pattByte & 0x80;
-      *(pixels++) = pixelBit ? fgColor : bgColor;
-      pattByte <<= 1;
-    }
+    /* 8 pixels unrolled */
+    *pixels++ = (pattByte & 0x80) ? fgColor : bgColor; pattByte <<= 1;
+    *pixels++ = (pattByte & 0x80) ? fgColor : bgColor; pattByte <<= 1;
+    *pixels++ = (pattByte & 0x80) ? fgColor : bgColor; pattByte <<= 1;
+    *pixels++ = (pattByte & 0x80) ? fgColor : bgColor; pattByte <<= 1;
+    *pixels++ = (pattByte & 0x80) ? fgColor : bgColor; pattByte <<= 1;
+    *pixels++ = (pattByte & 0x80) ? fgColor : bgColor; pattByte <<= 1;
+    *pixels++ = (pattByte & 0x80) ? fgColor : bgColor; pattByte <<= 1;
+    *pixels++ = (pattByte & 0x80) ? fgColor : bgColor;
   }
 
   vrEmuTms9918OutputSprites(tms9918, y, pixels - TMS9918_PIXELS_X);
@@ -582,23 +570,27 @@ static void __time_critical_func(vrEmuTms9918GraphicsIIScanLine)(VrEmuTms9918* t
     & ((tms9918->registers[TMS_REG_COLOR_TABLE] & 0x60) << 6));
 
   /* iterate over each tile in this row */
+  uint8_t *dst = pixels;
   for (uint8_t tileX = 0; tileX < GRAPHICS_NUM_COLS; ++tileX)
   {
     uint8_t pattIdx = tms9918->vram[rowNamesAddr + tileX] & nameMask;
 
     const size_t pattRowOffset = pattIdx * PATTERN_BYTES + pattRow;
-    const uint8_t pattByte = patternTable[pattRowOffset];
+    uint8_t pb = patternTable[pattRowOffset];
     const uint8_t colorByte = colorTable[pattRowOffset];
 
-    const vrEmuTms9918Color fgColor = tmsFgColor(tms9918, colorByte);
-    const vrEmuTms9918Color bgColor = tmsBgColor(tms9918, colorByte);
+    const uint8_t fg = tmsFgColor(tms9918, colorByte);
+    const uint8_t bg = tmsBgColor(tms9918, colorByte);
 
-    /* iterate over each bit of this pattern byte */
-    for (uint8_t pattBit = 0; pattBit < GRAPHICS_CHAR_WIDTH; ++pattBit)
-    {
-      const bool pixelBit = (pattByte << pattBit) & 0x80;
-      pixels[tileX * GRAPHICS_CHAR_WIDTH + pattBit] = (uint8_t)(pixelBit ? fgColor : bgColor);
-    }
+    /* 8 pixels unrolled — eliminates loop counter and removes indexed write */
+    *dst++ = (pb & 0x80) ? fg : bg; pb <<= 1;
+    *dst++ = (pb & 0x80) ? fg : bg; pb <<= 1;
+    *dst++ = (pb & 0x80) ? fg : bg; pb <<= 1;
+    *dst++ = (pb & 0x80) ? fg : bg; pb <<= 1;
+    *dst++ = (pb & 0x80) ? fg : bg; pb <<= 1;
+    *dst++ = (pb & 0x80) ? fg : bg; pb <<= 1;
+    *dst++ = (pb & 0x80) ? fg : bg; pb <<= 1;
+    *dst++ = (pb & 0x80) ? fg : bg;
   }
 
   vrEmuTms9918OutputSprites(tms9918, y, pixels);

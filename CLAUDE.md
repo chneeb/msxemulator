@@ -302,6 +302,8 @@ of it is RP2350/pico_lib-specific; what carries over to this RP2040 + PicoDVI po
   (`0079:0011`): byte 0 is a constant `01`, parsed as the X axis, so Left is held constantly.
   Fixed byte maps for this and other cheap pads are in frank-snes
   (`~/Source/frank-snes/drivers/usbhid/hid_app.c`, adopted by galagino_pizero/usb_input.c).
+  **Applied here:** `pad_maps[]` in `joystick.c` (VID:PID → byte layout, A/B → TRIG A/B);
+  `hid_app.c` skips the descriptor parser for known pads and calls `parse_mapped_report()`.
 - **On-screen diagnostics** in the picture's side margins (timings, missed lines, USB IDs and
   raw reports) proved more practical than a serial console; see galagino_pizero/main.cpp.
 - The RP2350's SIO TMDS encoder (a big win there) doesn't exist on RP2040.

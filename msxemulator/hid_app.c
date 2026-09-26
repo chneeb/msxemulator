@@ -55,6 +55,14 @@ void parse_gamepad_report(uint8_t const *report, uint16_t len , uint8_t instance
 
 extern uint8_t hid_dev_addr,hid_instance;
 extern HID_ReportInfo_t *my_hid_info[4];
+extern volatile uint8_t gamepad_info;
+
+typedef struct pad_map pad_map_t;
+const pad_map_t *joystick_find_map(uint16_t vid, uint16_t pid);
+void parse_mapped_report(const pad_map_t *m, uint8_t const *report, uint16_t len);
+
+// Known pad per HID instance (joystick.c), decoded by fixed byte layout
+static const pad_map_t *itf_map[CFG_TUH_HID];
 
 void hid_app_task(void)
 {
@@ -80,9 +88,14 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
 
   printf("HID Interface Protocol = %s\r\n", protocol_str[itf_protocol]);
 
+  uint16_t vid = 0, pid = 0;
+  tuh_vid_pid_get(dev_addr, &vid, &pid);
+  itf_map[instance] = (itf_protocol == HID_ITF_PROTOCOL_NONE) ? joystick_find_map(vid, pid) : NULL;
+  if (itf_map[instance]) printf("Known gamepad %04x:%04x, using fixed layout.\n", vid, pid);
+
   // By default host stack will use activate boot protocol on supported interface.
   // Therefore for this simple example, we only need to parse generic report descriptor (with built-in parser)
-  if ( itf_protocol == HID_ITF_PROTOCOL_NONE )
+  if ( itf_protocol == HID_ITF_PROTOCOL_NONE && !itf_map[instance] )
   {
     hid_info[instance].report_count = tuh_hid_parse_report_descriptor(hid_info[instance].report_info, MAX_REPORT, desc_report, desc_len);
     printf("HID has %u reports \r\n", hid_info[instance].report_count);
@@ -108,6 +121,11 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
   printf("HID device address = %d, instance = %d is unmounted\r\n", dev_addr, instance);
   if(my_hid_info[instance]!=NULL) {
     	USB_FreeReportInfo(my_hid_info[instance]);
+    	my_hid_info[instance] = NULL;
+  }
+  if(itf_map[instance]) {
+    itf_map[instance] = NULL;
+    gamepad_info = 0x3f;   // release everything
   }
 }
 
@@ -131,6 +149,10 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
     // break;
 
     default:
+      if (itf_map[instance]) {
+        parse_mapped_report(itf_map[instance], report, len);
+        break;
+      }
       // Generic report requires matching ReportID and contents with previous parsed report info
       process_generic_report(dev_addr, instance, report, len);
     break;

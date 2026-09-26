@@ -108,6 +108,8 @@ can be disabled without pausing core1.
   `queue_try_peek_u32` → `queue_try_peek` which is flash-resident. Without the wrap, core1
   stalls mid-IRQ whenever XIP is disabled for `flash_range_program` → DVI PIO starves
   → solid red then black screen → monitor loses sync → stuck.
+- `interp_save` / `interp_restore` — SRAM via `--wrap` (RAM copies in `dvi_adapter.c`);
+  `tmds_encode_data_channel_16bpp` calls them on every encode (3× per scanline).
 - `core1_main`, `dvi_dma_irq_handler`, `tmds_encode_data_channel_16bpp`, `dvi_update_scanline_data_dma` — SRAM via `__not_in_flash_func` / `__dvi_func`
 
 Flash write sites use only `save_and_disable_interrupts` / `restore_interrupts` — no
@@ -283,3 +285,23 @@ I2C1 on GPIO 2 (SDA) / GPIO 3 (SCL). Polled at VBlank. Bit mapping into PSG reg 
 - **64KB block erase interrupt blackout** — `flash_range_erase` for 64KB holds interrupts off for up to 400ms; TinyUSB host stack on core0 is not serviced during this window. For the SD path this happens pre-core1 (no DVI, no USB yet), so it is benign.
 - **FatFs write enabled** — `FF_FS_READONLY 0` in `fatfs/ffconf.h`; needed to write `SELROM1`/`SELROM2` marker files. The SD card itself is only written by the menu (two tiny files); ROM data is only ever read.
 - **DVI TMDS timing** — `DVI_N_TMDS_BUFFERS=8` (8 × 3840 bytes = 30.7 KB) gives ~507 µs of burst slack. `TMDS_ENCODE_UNROLL=2` halves loop branch overhead in the encode inner loop. The Graphics I/II tile inner loops are fully unrolled (8 pixels, running pointer). Palette expansion uses 32-bit paired stores. Together these eliminated solid-red scanline artifacts under heavy sprite load.
+
+## Lessons from galagino (2026-09-26)
+
+Found while porting Galagino to the RP2350-PiZero (`~/Source/galagino/galagino_pizero`). Most
+of it is RP2350/pico_lib-specific; what carries over to this RP2040 + PicoDVI port:
+
+- **Flash audit on core 1.** A single flash fetch on core 1's DVI path shows up as red lines
+  when core 0 thrashes the XIP cache. This port already moved the queue ops and `memset` into
+  RAM. To find anything left (libdvi IRQ path, newlib `memcpy`, SDK helpers, const tables read
+  per line), run `arm-none-eabi-objdump -D -j .data <elf>` and look for `*_veneer` calls from
+  core 1 functions. Galagino fixed its leftovers with `-Wl,--wrap=<fn>` to RAM copies
+  (galagino_pizero/ram_wrappers.c), and a lambda in the DVI IRQ, since lambdas don't inherit
+  `__not_in_flash_func`.
+- **USB gamepads:** the LUFA `hidparser` + `joystick.c` logic misreads a cheap SNES pad
+  (`0079:0011`): byte 0 is a constant `01`, parsed as the X axis, so Left is held constantly.
+  Fixed byte maps for this and other cheap pads are in frank-snes
+  (`~/Source/frank-snes/drivers/usbhid/hid_app.c`, adopted by galagino_pizero/usb_input.c).
+- **On-screen diagnostics** in the picture's side margins (timings, missed lines, USB IDs and
+  raw reports) proved more practical than a serial console; see galagino_pizero/main.cpp.
+- The RP2350's SIO TMDS encoder (a big win there) doesn't exist on RP2040.

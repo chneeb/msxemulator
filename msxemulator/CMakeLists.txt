@@ -62,6 +62,9 @@ target_link_options(msxemulator PRIVATE
     "-Wl,--wrap=queue_try_peek"
     "-Wl,--wrap=queue_add_blocking"
     "-Wl,--wrap=queue_remove_blocking"
+    # interp_save/restore are called per scanline by tmds_encode_data_channel_16bpp.
+    "-Wl,--wrap=interp_save"
+    "-Wl,--wrap=interp_restore"
 )
 
 pico_add_extra_outputs(msxemulator)

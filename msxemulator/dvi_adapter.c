@@ -19,6 +19,7 @@
 #include "pico/multicore.h"
 #include "pico/util/queue.h"
 #include "hardware/sync.h"
+#include "hardware/interp.h"
 
 // TMS9918A 16-color palette in RGB555 (bit15=0, R[14:10], G[9:5], B[4:0])
 // Source: TMS9918A datasheet + standard MSX colour approximations.
@@ -272,4 +273,32 @@ void __not_in_flash_func(__wrap_queue_remove_blocking)(queue_t *q, void *data) {
         spin_unlock(q->core.spin_lock, save);
         __wfe();
     }
+}
+
+// -----------------------------------------------------------------------
+// SRAM-resident interp_save / interp_restore
+//
+// tmds_encode_data_channel_16bpp (libdvi/tmds_encode.c) calls these on every
+// encode (3 channels per scanline). The SDK versions are flash-resident, so
+// without these wraps core1 fetches from XIP on every line.
+// -----------------------------------------------------------------------
+
+void __not_in_flash_func(__wrap_interp_save)(interp_hw_t *interp, interp_hw_save_t *saver) {
+    saver->accum[0] = interp->accum[0];
+    saver->accum[1] = interp->accum[1];
+    saver->base[0] = interp->base[0];
+    saver->base[1] = interp->base[1];
+    saver->base[2] = interp->base[2];
+    saver->ctrl[0] = interp->ctrl[0];
+    saver->ctrl[1] = interp->ctrl[1];
+}
+
+void __not_in_flash_func(__wrap_interp_restore)(interp_hw_t *interp, interp_hw_save_t *saver) {
+    interp->accum[0] = saver->accum[0];
+    interp->accum[1] = saver->accum[1];
+    interp->base[0] = saver->base[0];
+    interp->base[1] = saver->base[1];
+    interp->base[2] = saver->base[2];
+    interp->ctrl[0] = saver->ctrl[0];
+    interp->ctrl[1] = saver->ctrl[1];
 }

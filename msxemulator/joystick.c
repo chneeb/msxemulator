@@ -9,6 +9,12 @@
 
 #define CONFIG_BUTTON_A     GAMEPAD_BUTTON_0
 #define CONFIG_BUTTON_B     GAMEPAD_BUTTON_1
+// Select and Start on generic pads (button usages). Layouts differ, so two
+// usages each, as in uf2loader's menu.
+#define CONFIG_BUTTON_SELECT_A  7
+#define CONFIG_BUTTON_SELECT_B  9
+#define CONFIG_BUTTON_START_A   8
+#define CONFIG_BUTTON_START_B   10
 
 static const char *const BUTTON_NAMES[] = {"NONE", "UP", "RIGHT", "DOWN", "LEFT", "A", "B"};
 //(hat format, 8 is released, 0=N, 1=NE, 2=E, 3=SE, 4=S, 5=SW, 6=W, 7=NW)
@@ -26,6 +32,8 @@ typedef union
 		bool left : 1;
 		bool button1 : 1;
 		bool button2 : 1;
+		bool start : 1;
+		bool select : 1;
 	};
 	struct
 	{
@@ -47,17 +55,20 @@ typedef struct pad_map
 	bool hat;          // false: axes at dx/dy (0x7f centre), true: hat in low nibble of dx
 	uint8_t dx, dy;
 	pad_bit_t a, b;    // A -> TRIG A, B -> TRIG B
+	pad_bit_t start, select;  // Select + Start: menu (Start/Select bits from uf2loader)
 } pad_map_t;
 
+#define SNES_CLONE_BUTTONS {5, 0x20}, {5, 0x40}, {6, 0x20}, {6, 0x10}
+
 static const pad_map_t pad_maps[] = {
-	{0x0079, 0x0006, false, 0, 1, {5, 0x20}, {5, 0x40}},   // DragonRise "USB Gamepad"
-	{0x0079, 0x0011, false, 3, 4, {5, 0x20}, {5, 0x40}},   // SNES clone
-	{0x081f, 0xe401, false, 0, 1, {5, 0x20}, {5, 0x40}},   // SNES clone
-	{0x0810, 0xe501, false, 3, 4, {5, 0x20}, {5, 0x40}},   // SNES clone variant
-	{0x046d, 0xc219, true,  5, 0, {5, 0x20}, {5, 0x40}},   // Logitech
-	{0x11ff, 0x3331, false, 0, 1, {5, 0x80}, {5, 0x40}},
-	{0x2563, 0x0575, true,  2, 0, {0, 0x04}, {0, 0x02}},
-	{0xfeed, 0x2320, true,  5, 0, {6, 0x01}, {6, 0x02}},
+	{0x0079, 0x0006, false, 0, 1, SNES_CLONE_BUTTONS},   // DragonRise "USB Gamepad"
+	{0x0079, 0x0011, false, 3, 4, SNES_CLONE_BUTTONS},   // SNES clone
+	{0x081f, 0xe401, false, 0, 1, SNES_CLONE_BUTTONS},   // SNES clone
+	{0x0810, 0xe501, false, 3, 4, SNES_CLONE_BUTTONS},   // SNES clone variant
+	{0x046d, 0xc219, true,  5, 0, SNES_CLONE_BUTTONS},   // Logitech
+	{0x11ff, 0x3331, false, 0, 1, {5, 0x80}, {5, 0x40}, {6, 0x20}, {6, 0x10}},
+	{0x2563, 0x0575, true,  2, 0, {0, 0x04}, {0, 0x02}, {1, 0x02}, {1, 0x01}},
+	{0xfeed, 0x2320, true,  5, 0, {6, 0x01}, {6, 0x02}, {7, 0x08}, {7, 0x04}},
 };
 
 const pad_map_t *joystick_find_map(uint16_t vid, uint16_t pid)
@@ -71,6 +82,41 @@ const pad_map_t *joystick_find_map(uint16_t vid, uint16_t pid)
 static inline bool pad_bit(const uint8_t *r, uint16_t len, pad_bit_t b)
 {
 	return b.byte < len && (r[b.byte] & b.mask);
+}
+
+extern uint32_t menumode;
+extern volatile uint8_t keypressed;
+
+// Play without a keyboard: Select + Start does what F12 does (opens the menu,
+// or leaves it), and in the menu the pad sends the keys the menu reads:
+// Up/Down = cursor keys, Left/Right = Page Up/Down, A = Enter, B = Esc.
+static void pad_menu_input(pad_buttons current)
+{
+	static pad_buttons prev = {0};
+	uint8_t pressed = current.value & ~prev.value;
+	bool combo = current.start && current.select;
+	bool combo_new = combo && !(prev.start && prev.select);
+	prev = current;
+
+	if (combo_new) {
+		if (menumode == 0) {
+			menumode = 1;
+			keypressed = 0;
+		} else {
+			keypressed = 0x45;   // F12
+		}
+		return;
+	}
+	if (menumode == 0 || combo)
+		return;
+	pad_buttons p;
+	p.value = pressed;
+	if (p.up)      keypressed = 0x52;
+	if (p.down)    keypressed = 0x51;
+	if (p.left)    keypressed = 0x4b;   // Page Up
+	if (p.right)   keypressed = 0x4e;   // Page Down
+	if (p.button1) keypressed = 0x28;   // Enter
+	if (p.button2) keypressed = 0x29;   // Esc
 }
 
 void parse_mapped_report(const pad_map_t *m, uint8_t const *r, uint16_t len)
@@ -90,6 +136,9 @@ void parse_mapped_report(const pad_map_t *m, uint8_t const *r, uint16_t len)
 	}
 	if (pad_bit(r, len, m->a)) current.button1 = 1;
 	if (pad_bit(r, len, m->b)) current.button2 = 1;
+	if (pad_bit(r, len, m->start)) current.start = 1;
+	if (pad_bit(r, len, m->select)) current.select = 1;
+	pad_menu_input(current);
 
 	uint8_t value = current.value;
 	uint8_t info = 0x3f;
@@ -228,6 +277,20 @@ void parse_gamepad_report(uint8_t const *report, uint16_t len , uint8_t instance
 						current.button2 = 1;
 					}
 				}
+				else if (usage == CONFIG_BUTTON_SELECT_A || usage == CONFIG_BUTTON_SELECT_B)
+				{
+					if (item->Value)
+					{
+						current.select = 1;
+					}
+				}
+				else if (usage == CONFIG_BUTTON_START_A || usage == CONFIG_BUTTON_START_B)
+				{
+					if (item->Value)
+					{
+						current.start = 1;
+					}
+				}
 			}
 			break;
 			}
@@ -273,6 +336,7 @@ void parse_gamepad_report(uint8_t const *report, uint16_t len , uint8_t instance
 		// 	}
 		// }
 		// printf("\n");
+		pad_menu_input(current);
 		previous.value = current.value;
 	}
 }

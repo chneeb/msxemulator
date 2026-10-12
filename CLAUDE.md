@@ -173,8 +173,20 @@ FatFs driver is in `msxemulator/fatfs/` (write-enabled, LFN enabled).
    in 4KB chunks (64KB block erase, watchdog-guarded). Then core1 / DVI start normally.
 
 3. **Non-watchdog reset** — `SELROM1`/`SELROM2` still exist from the previous session.
-   Boot reads the file size from SD (no flash write) and runs `cart_type_checker()` to
-   restore the mapper type. ROM is accessed via XIP pointer as before.
+   Boot compares the cart slot in flash with the SD file (`cart_matches_sd()`, 4KB
+   chunks). If they match, it only takes the file size; if not, it flashes the ROM again
+   with `flash_rom_from_sd()`. Then `cart_type_checker()` restores the mapper type and
+   the ROM is accessed via XIP pointer as before. The compare is needed under uf2loader:
+   another app installed from its menu can overwrite the cart slots, and msxemulator
+   is then started with a normal (not `watchdog_enable`) reboot.
+
+**Mapper detection** (`cart_type_checker()`, ROMs of 64KB or more): counts `LD (nn00h),A`
+writes to each mapper's bank registers. It also counts writes to `60FFh/68FFh/70FFh/78FFh`
+as ASCII 8: Konami games patched to ASCII 8 (e.g. the common Nemesis/Gradius dump,
+sha1 50efb704…) write the registers there. Only these four addresses; counting the whole
+6000-7FFFh range misdetects Metal Gear as ASCII 8 (found in PicoCalc-MCUME's
+`GuessROM()`). Verified on device: Galaga and Goonies (32KB, plain), Nemesis (ASCII 8).
+This is an MSX1 emulator, so MSX2 games (Metal Gear, Vampire Killer) don't run.
 
 `flash_rom_from_sd()` is a static helper in `msxemulator.c` (near `cart_write`). It reuses
 the global `flash_buffer[4096]` and the same 64KB erase strategy as `cart_write`.
@@ -211,7 +223,7 @@ dead for the SD case. Next cleanup step:
 
 ### Menu navigation
 
-Press **F12** on the USB keyboard to open the menu.
+Press **F12** on the USB keyboard, or **Select + Start** on a USB gamepad, to open the menu.
 
 | Menu item | Action                                        |
 |-----------|-----------------------------------------------|
@@ -227,6 +239,13 @@ Press **F12** on the USB keyboard to open the menu.
 
 Arrow keys to navigate, Enter to select, F12/Escape to return to emulator.
 After loading a ROM, use Reset (item 12) to boot it.
+
+**Gamepad in the menu** (`pad_menu_input()` in `joystick.c`, no keyboard needed): Select +
+Start = F12 (open/close the menu); in the menu Up/Down = cursor keys, Left/Right = Page
+Up/Down, A = Enter, B = Escape. One key per press, no repeat. Select/Start come from the
+fixed maps in `pad_maps[]` (positions from uf2loader's `ui/input_usb.c`) or button usages
+7/9 and 8/10 on parsed pads. Not for the NES Mini/NES controllers. Typing a tape file name
+still needs a keyboard.
 
 ## Known issues / fixes applied
 

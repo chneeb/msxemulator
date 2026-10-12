@@ -1738,6 +1738,29 @@ static uint32_t flash_rom_from_sd(const char *sd_full_path, uint32_t cart_base_a
     return (uint32_t)filesize;
 }
 
+// True if the cart slot at cart_base_addr holds the ROM file sd_full_path.
+// Another app (e.g. one installed by uf2loader) can have overwritten the slot
+// since the ROM was flashed.
+static bool cart_matches_sd(const char *sd_full_path, uint32_t cart_base_addr) {
+    FIL fil;
+    if (f_open(&fil, sd_full_path, FA_READ) != FR_OK)
+        return false;
+    const uint8_t *flash = (const uint8_t *)cart_base_addr;
+    bool match = true;
+    UINT br;
+    for (uint32_t ofs = 0; match; ofs += br) {
+        if (f_read(&fil, flash_buffer, 4096, &br) != FR_OK) {
+            match = false;
+            break;
+        }
+        if (br == 0)
+            break;
+        match = memcmp(flash_buffer, flash + ofs, br) == 0;
+    }
+    f_close(&fil);
+    return match;
+}
+
 void cart_write(uint32_t cartno) {
 
     int32_t filesize;
@@ -2700,7 +2723,8 @@ int main() {
     // SELROM1 / SELROM2 on the SD card hold the full path of the last ROM
     // selected in the menu (e.g. "/msx/GAME.ROM").
     // On watchdog reboot (triggered by menu): stream ROM from SD to flash.
-    // On hardware / power-on reset: ROM already in flash — just read size.
+    // On hardware / power-on reset: ROM normally already in flash — compare it
+    // with the SD file and flash it again only if it differs.
     {
         static const char * const selrom_files[2] = { "/msx/SELROM1", "/msx/SELROM2" };
         static const uint32_t cart_bases[2] = { CART1BASE, CART2BASE };
@@ -2723,6 +2747,10 @@ int main() {
             uart_tx_wait_blocking(uart1);
 
             if (watchdog_boot) {
+                boot_rom_size[slot] = flash_rom_from_sd(rompath, cart_bases[slot]);
+            } else if (!cart_matches_sd(rompath, cart_bases[slot])) {
+                printf("[BOOT] slot%d flash differs from SD, flashing again\n", slot);
+                uart_tx_wait_blocking(uart1);
                 boot_rom_size[slot] = flash_rom_from_sd(rompath, cart_bases[slot]);
             } else {
                 // ROM already in flash — open SD file only to get its size.

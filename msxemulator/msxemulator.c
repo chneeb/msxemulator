@@ -1542,6 +1542,29 @@ void cart_type_checker(uint8_t cartno, uint32_t cartsize) {
             param=cartrom2[i+2];
         }
 
+        // Konami games patched to ASCII 8 (e.g. a common Nemesis/Gradius dump)
+        // write the bank registers at xxFFh instead of xx00h. Only these four:
+        // counting the whole 6000-7FFFh range misdetects Metal Gear as ASCII 8
+        // (from PicoCalc-MCUME's GuessROM()).
+        {
+            const uint8_t *rom = cartno ? cartrom2 : cartrom1;
+            if((rom[i]==0x32)&&(rom[i+1]==0xff)) {
+                switch(rom[i+2]) {
+                    case 0x68:
+                    case 0x78:
+                        hists[1]++;
+                        break;
+                    case 0x60:
+                    case 0x70:
+                        hists[1]++;
+                        hists[2]++;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
         switch(param) {
 
             case 0x50:
